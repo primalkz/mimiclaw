@@ -281,6 +281,50 @@ static bool tg_response_is_ok(const char *resp, const char **out_desc)
     return false;
 }
 
+/* Resolve a file_id to its download URL via getFile (caller frees) */
+static char *tg_resolve_file_url(const char *file_id)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "getFile?file_id=%s", file_id);
+    char *resp = tg_api_call(path, NULL);
+    if (!resp) return NULL;
+
+    char *url = NULL;
+    cJSON *root = cJSON_Parse(resp);
+    free(resp);
+    if (root) {
+        cJSON *result = cJSON_GetObjectItem(root, "result");
+        cJSON *fp = result ? cJSON_GetObjectItem(result, "file_path") : NULL;
+        if (fp && cJSON_IsString(fp) && fp->valuestring[0]) {
+            size_t need = strlen("https://api.telegram.org/file/bot") +
+                          strlen(s_bot_token) + 1 + strlen(fp->valuestring) + 1;
+            url = malloc(need);
+            if (url) {
+                snprintf(url, need, "https://api.telegram.org/file/bot%s/%s",
+                         s_bot_token, fp->valuestring);
+            }
+        }
+    }
+    cJSON_Delete(root);
+    return url;
+}
+
+/* Largest photo file_id from a message or its reply_to_message, or NULL */
+static cJSON *tg_largest_photo_id(cJSON *message)
+{
+    cJSON *photo = cJSON_GetObjectItem(message, "photo");
+    if (!cJSON_IsArray(photo) || cJSON_GetArraySize(photo) == 0) {
+        cJSON *reply = cJSON_GetObjectItem(message, "reply_to_message");
+        photo = reply ? cJSON_GetObjectItem(reply, "photo") : NULL;
+    }
+    if (!cJSON_IsArray(photo) || cJSON_GetArraySize(photo) == 0) return NULL;
+
+    /* photo sizes are ordered ascending; last is largest */
+    cJSON *largest = cJSON_GetArrayItem(photo, cJSON_GetArraySize(photo) - 1);
+    cJSON *id = largest ? cJSON_GetObjectItem(largest, "file_id") : NULL;
+    return (id && cJSON_IsString(id)) ? id : NULL;
+}
+
 static void process_updates(const char *json_str)
 {
     cJSON *root = cJSON_Parse(json_str);
@@ -318,8 +362,16 @@ static void process_updates(const char *json_str)
         cJSON *message = cJSON_GetObjectItem(update, "message");
         if (!message) continue;
 
+        /* Text, or caption on a photo (which may be a replied-to message) */
         cJSON *text = cJSON_GetObjectItem(message, "text");
-        if (!text || !cJSON_IsString(text)) continue;
+        cJSON *caption = cJSON_GetObjectItem(message, "caption");
+        cJSON *photo_id = tg_largest_photo_id(message);
+
+        const char *msg_text = NULL;
+        if (text && cJSON_IsString(text)) msg_text = text->valuestring;
+        else if (caption && cJSON_IsString(caption)) msg_text = caption->valuestring;
+
+        if (!msg_text && !photo_id) continue;
 
         cJSON *chat = cJSON_GetObjectItem(message, "chat");
         if (!chat) continue;
@@ -353,19 +405,26 @@ static void process_updates(const char *json_str)
             seen_msg_insert(msg_key);
         }
 
-        ESP_LOGI(TAG, "Message update_id=%" PRId64 " message_id=%d from chat %s: %.40s...",
-                 uid, msg_id_val, chat_id_str, text->valuestring);
+        ESP_LOGI(TAG, "Message update_id=%" PRId64 " message_id=%d from chat %s: %.40s%s",
+                 uid, msg_id_val, chat_id_str,
+                 msg_text ? msg_text : "[image]", photo_id ? " [+image]" : "");
 
         /* Push to inbound bus */
         mimi_msg_t msg = {0};
         strncpy(msg.channel, MIMI_CHAN_TELEGRAM, sizeof(msg.channel) - 1);
         strncpy(msg.chat_id, chat_id_str, sizeof(msg.chat_id) - 1);
-        msg.content = strdup(text->valuestring);
+        msg.content = strdup(msg_text ? msg_text : "");
+        if (photo_id) {
+            msg.image_url = tg_resolve_file_url(photo_id->valuestring);
+        }
         if (msg.content) {
             if (message_bus_push_inbound(&msg) != ESP_OK) {
                 ESP_LOGW(TAG, "Inbound queue full, drop telegram message");
                 free(msg.content);
+                free(msg.image_url);
             }
+        } else {
+            free(msg.image_url);
         }
     }
 

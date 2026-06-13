@@ -487,6 +487,7 @@ static cJSON *convert_messages_openai(const char *system_prompt, cJSON *messages
             /* tool_result blocks become role=tool */
             cJSON *block;
             bool has_user_text = false;
+            const char *image_url_str = NULL;
             char *text_buf = NULL;
             size_t off = 0;
             cJSON_ArrayForEach(block, content) {
@@ -517,9 +518,34 @@ static cJSON *convert_messages_openai(const char *system_prompt, cJSON *messages
                         }
                         has_user_text = true;
                     }
+                } else if (btype && cJSON_IsString(btype) && strcmp(btype->valuestring, "image_url") == 0) {
+                    cJSON *iu = cJSON_GetObjectItem(block, "image_url");
+                    cJSON *url = iu ? cJSON_GetObjectItem(iu, "url") : NULL;
+                    if (url && cJSON_IsString(url) && url->valuestring[0]) {
+                        image_url_str = url->valuestring;
+                    }
                 }
             }
-            if (has_user_text) {
+            if (image_url_str) {
+                /* Multimodal: content is an array of text + image_url parts */
+                cJSON *um = cJSON_CreateObject();
+                cJSON_AddStringToObject(um, "role", "user");
+                cJSON *parts = cJSON_CreateArray();
+                if (has_user_text) {
+                    cJSON *tp = cJSON_CreateObject();
+                    cJSON_AddStringToObject(tp, "type", "text");
+                    cJSON_AddStringToObject(tp, "text", text_buf);
+                    cJSON_AddItemToArray(parts, tp);
+                }
+                cJSON *ip = cJSON_CreateObject();
+                cJSON_AddStringToObject(ip, "type", "image_url");
+                cJSON *iu = cJSON_CreateObject();
+                cJSON_AddStringToObject(iu, "url", image_url_str);
+                cJSON_AddItemToObject(ip, "image_url", iu);
+                cJSON_AddItemToArray(parts, ip);
+                cJSON_AddItemToObject(um, "content", parts);
+                cJSON_AddItemToArray(out, um);
+            } else if (has_user_text) {
                 cJSON *um = cJSON_CreateObject();
                 cJSON_AddStringToObject(um, "role", "user");
                 cJSON_AddStringToObject(um, "content", text_buf);

@@ -4,8 +4,10 @@
 #include "proxy/http_proxy.h"
 
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_http_client.h"
@@ -16,6 +18,8 @@
 static const char *TAG = "telegram";
 
 static char s_bot_token[128] = MIMI_SECRET_TG_TOKEN;
+static char s_bot_mention[64] = {0};   /* "@username" from getMe */
+static int64_t s_bot_id = 0;
 static int64_t s_update_offset = 0;
 static int64_t s_last_saved_offset = -1;
 static int64_t s_last_offset_save_us = 0;
@@ -281,6 +285,47 @@ static bool tg_response_is_ok(const char *resp, const char **out_desc)
     return false;
 }
 
+/* Case-insensitive @mention check with word boundary */
+static bool text_mentions_bot(const char *text)
+{
+    if (!s_bot_mention[0]) return false;
+    size_t mlen = strlen(s_bot_mention);
+    for (const char *p = text; *p; p++) {
+        if (strncasecmp(p, s_bot_mention, mlen) == 0) {
+            char prev = (p == text) ? ' ' : p[-1];
+            char next = p[mlen];
+            if (!isalnum((unsigned char)prev) && prev != '_' &&
+                !isalnum((unsigned char)next) && next != '_') return true;
+        }
+    }
+    return false;
+}
+
+static void fetch_bot_identity(void)
+{
+    char *resp = tg_api_call("getMe", NULL);
+    if (!resp) return;
+
+    cJSON *root = cJSON_Parse(resp);
+    free(resp);
+    if (!root) return;
+
+    cJSON *ok = cJSON_GetObjectItem(root, "ok");
+    cJSON *result = cJSON_GetObjectItem(root, "result");
+    if (cJSON_IsTrue(ok) && result) {
+        cJSON *id = cJSON_GetObjectItem(result, "id");
+        cJSON *username = cJSON_GetObjectItem(result, "username");
+        if (cJSON_IsNumber(id)) {
+            s_bot_id = (int64_t)id->valuedouble;
+        }
+        if (username && cJSON_IsString(username) && username->valuestring[0]) {
+            snprintf(s_bot_mention, sizeof(s_bot_mention), "@%s", username->valuestring);
+            ESP_LOGI(TAG, "Bot identity: %s (id %" PRId64 ")", s_bot_mention, s_bot_id);
+        }
+    }
+    cJSON_Delete(root);
+}
+
 static void process_updates(const char *json_str)
 {
     cJSON *root = cJSON_Parse(json_str);
@@ -323,6 +368,30 @@ static void process_updates(const char *json_str)
 
         cJSON *chat = cJSON_GetObjectItem(message, "chat");
         if (!chat) continue;
+
+        /* In groups, only react when @mentioned or replied to */
+        cJSON *chat_type = cJSON_GetObjectItem(chat, "type");
+        bool is_group = chat_type && cJSON_IsString(chat_type) &&
+                        (strcmp(chat_type->valuestring, "group") == 0 ||
+                         strcmp(chat_type->valuestring, "supergroup") == 0);
+        if (is_group && s_bot_mention[0] == '\0') {
+            static bool warned;
+            if (!warned) {
+                ESP_LOGW(TAG, "Bot identity unknown (getMe pending), group filtering inactive");
+                warned = true;
+            }
+        }
+        if (is_group && s_bot_mention[0]) {
+            bool addressed = text_mentions_bot(text->valuestring);
+            if (!addressed) {
+                cJSON *reply = cJSON_GetObjectItem(message, "reply_to_message");
+                cJSON *from = reply ? cJSON_GetObjectItem(reply, "from") : NULL;
+                cJSON *from_id = from ? cJSON_GetObjectItem(from, "id") : NULL;
+                addressed = from_id && cJSON_IsNumber(from_id) &&
+                            (int64_t)from_id->valuedouble == s_bot_id;
+            }
+            if (!addressed) continue;
+        }
 
         cJSON *chat_id = cJSON_GetObjectItem(chat, "id");
         if (!chat_id) continue;
@@ -381,6 +450,10 @@ static void telegram_poll_task(void *arg)
             ESP_LOGW(TAG, "No bot token configured, waiting...");
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
+        }
+
+        if (s_bot_mention[0] == '\0') {
+            fetch_bot_identity();
         }
 
         char params[128];

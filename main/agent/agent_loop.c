@@ -192,10 +192,20 @@ static void agent_loop_task(void *arg)
 
         ESP_LOGI(TAG, "Processing message from %s:%s", msg.channel, msg.chat_id);
 
-        /* 1. Build system prompt */
-        context_build_system_prompt(system_prompt, MIMI_CONTEXT_BUF_SIZE);
-        append_turn_context_prompt(system_prompt, MIMI_CONTEXT_BUF_SIZE, &msg);
-        ESP_LOGI(TAG, "LLM turn context: channel=%s chat_id=%s", msg.channel, msg.chat_id);
+        bool has_image = (msg.image_url != NULL && msg.image_url[0]);
+
+        /* 1. Build system prompt. Image turns use a slim prompt and no tools */
+        if (has_image) {
+            snprintf(system_prompt, MIMI_CONTEXT_BUF_SIZE,
+                     "You are MimiClaw, a helpful assistant. The user shared an "
+                     "image. Look at the attached image and answer their question "
+                     "about it directly and concisely.");
+        } else {
+            context_build_system_prompt(system_prompt, MIMI_CONTEXT_BUF_SIZE);
+            append_turn_context_prompt(system_prompt, MIMI_CONTEXT_BUF_SIZE, &msg);
+        }
+        ESP_LOGI(TAG, "LLM turn context: channel=%s chat_id=%s%s",
+                 msg.channel, msg.chat_id, has_image ? " [vision]" : "");
 
         /* 2. Load session history into cJSON array */
         session_get_history_json(msg.chat_id, history_json,
@@ -204,10 +214,27 @@ static void agent_loop_task(void *arg)
         cJSON *messages = cJSON_Parse(history_json);
         if (!messages) messages = cJSON_CreateArray();
 
-        /* 3. Append current user message */
+        /* 3. Append current user message (array of text + image parts if image) */
         cJSON *user_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(user_msg, "role", "user");
-        cJSON_AddStringToObject(user_msg, "content", msg.content);
+        if (has_image) {
+            cJSON *parts = cJSON_CreateArray();
+            if (msg.content && msg.content[0]) {
+                cJSON *tp = cJSON_CreateObject();
+                cJSON_AddStringToObject(tp, "type", "text");
+                cJSON_AddStringToObject(tp, "text", msg.content);
+                cJSON_AddItemToArray(parts, tp);
+            }
+            cJSON *ip = cJSON_CreateObject();
+            cJSON_AddStringToObject(ip, "type", "image_url");
+            cJSON *iu = cJSON_CreateObject();
+            cJSON_AddStringToObject(iu, "url", msg.image_url);
+            cJSON_AddItemToObject(ip, "image_url", iu);
+            cJSON_AddItemToArray(parts, ip);
+            cJSON_AddItemToObject(user_msg, "content", parts);
+        } else {
+            cJSON_AddStringToObject(user_msg, "content", msg.content);
+        }
         cJSON_AddItemToArray(messages, user_msg);
 
         /* 4. ReAct loop */
@@ -235,7 +262,7 @@ static void agent_loop_task(void *arg)
 #endif
 
             llm_response_t resp;
-            err = llm_chat_tools(system_prompt, messages, tools_json, &resp);
+            err = llm_chat_tools(system_prompt, messages, has_image ? NULL : tools_json, &resp);
 
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "LLM call failed: %s", esp_err_to_name(err));
@@ -316,6 +343,7 @@ static void agent_loop_task(void *arg)
 
         /* Free inbound message content */
         free(msg.content);
+        free(msg.image_url);
 
         /* Log memory status */
         ESP_LOGI(TAG, "Free PSRAM: %d bytes",

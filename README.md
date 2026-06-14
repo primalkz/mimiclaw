@@ -19,6 +19,40 @@
 
 MimiClaw turns a tiny ESP32-S3 board into a personal AI assistant. Plug it into USB power, connect to WiFi, and talk to it through Telegram — it handles any task you throw at it and evolves over time with local memory — all on a chip the size of a thumb.
 
+## About this fork
+
+mimiclaw-next is a fork of [memovai/mimiclaw](https://github.com/memovai/mimiclaw)
+that adds image input and carries four bug fixes. Everything else behaves like
+upstream.
+
+### Image input
+
+Send the bot a photo, or reply to an existing one with a question, and it
+answers about the image. The photo is resolved to a Telegram file URL and
+handed to the model as an `image_url` part, so the device never downloads or
+buffers the image itself. This needs a vision-capable, OpenAI-compatible model
+(tested with NVIDIA NIM's `nemotron-nano-12b-v2-vl`). In group chats the bot
+looks at an image when you @mention it or reply to it.
+
+### Fixes
+
+- Pin `esp_websocket_client` to `~1.5.0` so the build links on ESP-IDF v5.5.
+  Upstream's `^1.4.0` pulls 1.6.0+, which calls a function missing from the
+  tagged v5.5 release.
+- Reset the task watchdog around the blocking LLM HTTP call, so slow responses
+  (up to 120s) no longer reboot the device.
+- Read reasoning models' output from `reasoning_content` when `content` is
+  empty, so DeepSeek-R1 and similar models stop returning blank replies.
+- In group chats, only respond when @mentioned or replied to, instead of
+  answering every message and burning tokens.
+
+Each fix is also open as a pull request upstream (#181, #182, #187, #189).
+
+### Notes
+
+- The model endpoint and key come from `mimi_secrets.h`.
+- Built and tested on ESP32-S3-N16R8 with ESP-IDF v5.5.2.
+
 ## Meet MimiClaw
 
 - **Tiny** — No Linux, no Node.js, no bloat — just pure C
